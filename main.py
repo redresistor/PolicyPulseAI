@@ -1,26 +1,13 @@
 import feedparser
 import requests
-from datetime import datetime
 from autogen import config_list_from_json
 import feedparser
 from atproto import Client, models
 import requests
 from bs4 import BeautifulSoup
 import os
-import asyncio
-import tempfile
 from dataclasses import dataclass
-from agents import Assistant
 from autogen_core.application import SingleThreadedAgentRuntime
-from autogen_core.base import AgentId, MessageContext
-from autogen_core.components import DefaultTopicId, RoutedAgent, default_subscription, message_handler
-from autogen_core.components.model_context import BufferedChatCompletionContext
-from autogen_core.components.models import (
-    AssistantMessage,
-    ChatCompletionClient,
-    SystemMessage,
-    UserMessage,
-)
 # from autogen_ext.models import OpenAIChatCompletionClient
 
 import autogen
@@ -36,8 +23,9 @@ llm_config = {"config_list": config_list, "cache_seed": 42}
 # Initialize runtime and assistants
 runtime = SingleThreadedAgentRuntime()
 
-initializer = autogen.UserProxyAgent(
-    name="Init",
+user = autogen.UserProxyAgent(
+    name="User",
+    llm_config=llm_config,
 )
 
 evaluator = autogen.AssistantAgent(
@@ -51,21 +39,23 @@ evaluator = autogen.AssistantAgent(
 
 summarizer = autogen.UserProxyAgent(
     name="Summarizer",
+    llm_config=llm_config,
     system_message="""You are the Summarizer. You take an article or piece of content and summarize it. You primarily are 
     concerned with summarzing the actions of President Donald Trump to extract the most impactful pieces of information from the content.
     You will also rate the impact of each action or policy on a scale of 1-10.""",
     human_input_mode="NEVER",
-    code_execution_config={
-        "last_n_messages": 5,
-        "work_dir": "paper",
-        "use_docker": False,
-    },  # Please set use_docker=True if docker is available to run the generated code. Using docker is safer than running the generated code directly.
+    # code_execution_config={
+    #     "last_n_messages": 5,
+    #     # "work_dir": "paper",
+    #     # llm_config=llm_config,
+    #     "use_docker": False,
+    # },  # Please set use_docker=True if docker is available to run the generated code. Using docker is safer than running the generated code directly.
 )
 
 def state_transition(last_speaker, groupchat):
     # messages = groupchat.messages
 
-    if last_speaker is initializer:
+    if last_speaker is user:
         # init -> retrieve
         return summarizer
     elif last_speaker == "Summarizer":
@@ -76,7 +66,7 @@ def state_transition(last_speaker, groupchat):
 
 
 groupchat = autogen.GroupChat(
-    agents=[initializer, summarizer],
+    agents=[user, summarizer, evaluator],
     messages=[],
     max_round=5,
     speaker_selection_method=state_transition,
@@ -107,7 +97,7 @@ def extract_news_from_article(link):
         
         # Extract the main content from an <article> tag
         article_content = soup.find('article')
-        if article_content:
+        if (article_content):
             return article_content.get_text(strip=True)
         else:
             return "No article content found."
@@ -118,18 +108,28 @@ def extract_news_from_article(link):
 def analyze_and_summarize(entries):
     summaries = []
     for entry in entries:
-        title = entry.title
-        summary = entry.summary if 'summary' in entry else entry.content[0].value
-        link = entry.link
-        news_content = extract_news_from_article(link) if 'youtube' not in link else "YouTube video content"
+        # title = entry.title
+        # # summary = entry.summary if 'summary' in entry else entry.content[0].value
+        # link = entry.link
+        # news_content = extract_news_from_article(link) if 'youtube' not in link else "YouTube video content"
 
-        message = f"Title: {title}\nSummary: {summary}\nLink: {link}\nContent: {news_content}"
+        chat = f"Given the following article content, ```Content: {entry}```, please summarize the actions of President Donald Trump and rate the impact of each action on a scale of 1-10."
         
-        initializer.initiate_chat(manager, message=message)
+        print(f"Sending to summarizer: {chat}")  # Debugging print statement
+
+        chat_manager = autogen.GroupChatManager(groupchat)
+        groupchat_result = user.initiate_chat(
+            chat_manager, message=chat
+        )
+        
+        print(f"Received from summarizer: {groupchat_result}")  # Debugging print statement
+
+        summaries.append(groupchat_result)  # Store the result in summaries
     return summaries
 
 # Function to post summary to BlueSky
 def post_to_bluesky(summaries):
+    print("Posting to BlueSky...")
     for summary in summaries:
         BSKY_CLIENT.post(summary)
 
@@ -138,7 +138,7 @@ def main():
     rss_feed_url = "https://www.google.com/alerts/feeds/14842518841889673538/2294658301143024541"
     entries = parse_rss_feed(rss_feed_url)
     summaries = analyze_and_summarize(entries)
-    post_to_bluesky(summaries)
+    # post_to_bluesky(summaries)
 
 if __name__ == "__main__":
     main()
