@@ -1,47 +1,92 @@
 import feedparser
 import requests
 from datetime import datetime
-import autogen
+from autogen import config_list_from_json
 import feedparser
 from atproto import Client, models
 import requests
 from bs4 import BeautifulSoup
 import os
+import asyncio
+import tempfile
+from dataclasses import dataclass
+from agents import Assistant
+from autogen_core.application import SingleThreadedAgentRuntime
+from autogen_core.base import AgentId, MessageContext
+from autogen_core.components import DefaultTopicId, RoutedAgent, default_subscription, message_handler
+from autogen_core.components.model_context import BufferedChatCompletionContext
+from autogen_core.components.models import (
+    AssistantMessage,
+    ChatCompletionClient,
+    SystemMessage,
+    UserMessage,
+)
+# from autogen_ext.models import OpenAIChatCompletionClient
 
+import autogen
 
-config_list = autogen.config_list_from_json(
+config_list = config_list_from_json(
     env_or_file="OAI_CONFIG_LIST.json",
     filter_dict={"model": ["llama31"]},  # comment out to get all
 )
+
 # Initialize autogen agents
 llm_config = {"config_list": config_list, "cache_seed": 42}
 
-# Initialize autogen agents
-user_proxy = autogen.UserProxyAgent(
-    name="User_proxy",
-    system_message="A human admin.",
+# Initialize runtime and assistants
+runtime = SingleThreadedAgentRuntime()
+
+initializer = autogen.UserProxyAgent(
+    name="Init",
+)
+
+evaluator = autogen.AssistantAgent(
+    name="Evaluator",
+    llm_config=llm_config,
+    system_message="""You are the Evaluator. Your only job is to evalute the summary of an article and the original 
+    article to ensure the summary is accurate.
+    Additionally, you are able to use your understanding of government policy and workings, as well as your understanding of
+    how democracy works, to provide suggested actions to take to counter the impact of the policy or action.""",
+)
+
+summarizer = autogen.UserProxyAgent(
+    name="Summarizer",
+    system_message="""You are the Summarizer. You take an article or piece of content and summarize it. You primarily are 
+    concerned with summarzing the actions of President Donald Trump to extract the most impactful pieces of information from the content.
+    You will also rate the impact of each action or policy on a scale of 1-10.""",
+    human_input_mode="NEVER",
     code_execution_config={
-        "last_n_messages": 2,
-        "work_dir": "groupchat",
+        "last_n_messages": 5,
+        "work_dir": "paper",
         "use_docker": False,
-    },
-    human_input_mode="TERMINATE",
+    },  # Please set use_docker=True if docker is available to run the generated code. Using docker is safer than running the generated code directly.
 )
-coder = autogen.AssistantAgent(
-    name="Coder",
-    llm_config=llm_config,
+
+def state_transition(last_speaker, groupchat):
+    # messages = groupchat.messages
+
+    if last_speaker is initializer:
+        # init -> retrieve
+        return summarizer
+    elif last_speaker == "Summarizer":
+        return evaluator
+    elif last_speaker == "Evaluator":
+        # research -> end
+        return None
+
+
+groupchat = autogen.GroupChat(
+    agents=[initializer, summarizer],
+    messages=[],
+    max_round=5,
+    speaker_selection_method=state_transition,
 )
-pm = autogen.AssistantAgent(
-    name="Product_manager",
-    system_message="Creative in software product ideas.",
-    llm_config=llm_config,
-)
-groupchat = autogen.GroupChat(agents=[user_proxy, coder, pm], messages=[], max_round=12)
 manager = autogen.GroupChatManager(groupchat=groupchat, llm_config=llm_config)
 
 # BlueSky credentials
-BSKY_USER = os.Environ.get("BSKY_USER")
-BSKY_PASS = os.Environ.get("BSKY_PASS")
+env = os.environ
+BSKY_USER = env.get("BSKY_USER")
+BSKY_PASS = env.get("BSKY_PASS")
 
 # Set up the BlueSky client
 BSKY_CLIENT = Client()
@@ -60,8 +105,8 @@ def extract_news_from_article(link):
         page_content = response.content
         soup = BeautifulSoup(page_content, 'html.parser')
         
-        # Example: Extract the main content from a <div> with class 'article-content'
-        article_content = soup.find('div', class_='article-content')
+        # Extract the main content from an <article> tag
+        article_content = soup.find('article')
         if article_content:
             return article_content.get_text(strip=True)
         else:
@@ -80,9 +125,7 @@ def analyze_and_summarize(entries):
 
         message = f"Title: {title}\nSummary: {summary}\nLink: {link}\nContent: {news_content}"
         
-        result = user_proxy.initiate_chat(manager, message=f"Please analyze and summarize the following entry: \"{message}\"")
-        print("SUMMARY WAS: ", result.summary)
-        summaries.append(result.summary)
+        initializer.initiate_chat(manager, message=message)
     return summaries
 
 # Function to post summary to BlueSky
