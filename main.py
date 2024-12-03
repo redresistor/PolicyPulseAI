@@ -8,9 +8,12 @@ from bs4 import BeautifulSoup
 import os
 from dataclasses import dataclass
 from autogen_core.application import SingleThreadedAgentRuntime
+from urllib.parse import urlparse
+from urllib.parse import parse_qs
 # from autogen_ext.models import OpenAIChatCompletionClient
 
 import autogen
+from datetime import datetime, timedelta
 
 config_list = config_list_from_json(
     env_or_file="OAI_CONFIG_LIST.json",
@@ -82,27 +85,25 @@ BSKY_PASS = env.get("BSKY_PASS")
 BSKY_CLIENT = Client()
 BSKY_CLIENT.login(BSKY_USER, BSKY_PASS)
 
-# Function to parse RSS feed
-def parse_rss_feed(url):
+# Function to parse RSS feed and filter entries from the last N hours
+def parse_rss_feed(url, hours=24):
     feed = feedparser.parse(url)
     entries = feed.entries
-    return entries
+    cutoff_time = datetime.now() - timedelta(hours=hours)
+    recent_entries = [entry for entry in entries if datetime(*entry.published_parsed[:6]) > cutoff_time]
+    return recent_entries
 
 # Function to extract news content from an article link
 def extract_news_from_article(link):
-    response = requests.get(link)
-    if response.status_code == 200:
-        page_content = response.content
-        soup = BeautifulSoup(page_content, 'html.parser')
-        
-        # Extract the main content from an <article> tag
-        article_content = soup.find('article')
-        if (article_content):
-            return article_content.get_text(strip=True)
+    try:
+        response = requests.get(link, allow_redirects=True)
+        if response.status_code == 200:
+            page_content = response.content
+            return page_content.decode('utf-8')  # Return the full HTML content as a string
         else:
-            return "No article content found."
-    else:
-        return f"Failed to retrieve the article. Status code: {response.status_code}"
+            return f"Failed to retrieve the article. Status code: {response.status_code}"
+    except requests.RequestException as e:
+        return f"An error occurred: {e}"
 
 # Function to send data to autogen agents for analysis and summary
 def analyze_and_summarize(entries):
@@ -110,20 +111,28 @@ def analyze_and_summarize(entries):
     for entry in entries:
         # title = entry.title
         # # summary = entry.summary if 'summary' in entry else entry.content[0].value
-        # link = entry.link
-        # news_content = extract_news_from_article(link) if 'youtube' not in link else "YouTube video content"
+        link = entry.link
+        print("link was: ", link)
+        parsed = urlparse(link)
+        actual_link = parse_qs(parsed.query)['url'][0]
+        news_content = extract_news_from_article(actual_link) if 'youtube' not in actual_link else "YouTube video content"
 
-        chat = f"Given the following article content, ```Content: {entry}```, please summarize the actions of President Donald Trump and rate the impact of each action on a scale of 1-10."
-        
-        print(f"Sending to summarizer: {chat}")  # Debugging print statement
+        chat = f"""Given the following HTML content, ```Content: {news_content}```, please summarize 
+        the actions of President Donald Trump and rate the impact of each action on a scale of 1-10.
+        Importantly, do not respond with any greetings or cordialities. Provide me only with the requested information in the form of:
+        Action/Policy: [Action/Policy]
+        Impact: [Rating]
+        Recommendation: [Recommendation]
+
+        in a well-formatted JSON response, if you can. Please remember that the full content may be spread across
+        many divs or spans, so you may need to extract the relevant information from the content.
+        """
 
         chat_manager = autogen.GroupChatManager(groupchat)
         groupchat_result = user.initiate_chat(
             chat_manager, message=chat
         )
         
-        print(f"Received from summarizer: {groupchat_result}")  # Debugging print statement
-
         summaries.append(groupchat_result)  # Store the result in summaries
     return summaries
 
@@ -136,9 +145,10 @@ def post_to_bluesky(summaries):
 # Main function
 def main():
     rss_feed_url = "https://www.google.com/alerts/feeds/14842518841889673538/2294658301143024541"
-    entries = parse_rss_feed(rss_feed_url)
+    entries = parse_rss_feed(rss_feed_url, hours=24)  # Adjust the hours as needed
     summaries = analyze_and_summarize(entries)
     # post_to_bluesky(summaries)
+    print(summaries)
 
 if __name__ == "__main__":
     main()
