@@ -11,6 +11,8 @@ from autogen_core.application import SingleThreadedAgentRuntime
 from urllib.parse import urlparse
 from urllib.parse import parse_qs
 from dateutil import parser
+import grapheme
+import time
 # from autogen_ext.models import OpenAIChatCompletionClient
 
 import autogen
@@ -235,15 +237,30 @@ def analyze_and_summarize(entries):
 
         summary = groupchat_result.chat_history[-1].get('content', '')
         summaries.append(groupchat_result)  # Store the result in summaries
-        print("\n\n----\nGROUPCHAT RESULT WAS: ", summary)
+        # print("\n\n----\nGROUPCHAT RESULT WAS: ", summary)
+
+        splits = summary.split("Action/Policy:")
         print("link was: ", actual_link,"\n===========\n")
-        post_to_bluesky(summary)
+        
+        url = 'http://tinyurl.com/api-create.php?url='
+        long_url = actual_link
+
+        response = requests.get(url+long_url)
+        short_url = response.text
+        for split in splits:
+            summary = "Link: " + short_url + "\nAction/Policy: " + split
+            if len(summary) < 200:
+                post_to_bluesky(summary, dry=False)
+                time.sleep(2)
+            else:
+                print("\n\n------\nTOO LONG TO POST TO BLUESKY! SKIPPING: \n", summary, "\n\n=========\n")
     return summaries
 
 # Function to post summary to BlueSky
-def post_to_bluesky(content):
+def post_to_bluesky(content, dry=True):
     print("\n--\nPosting to BlueSky... \n", content)
-    BSKY_CLIENT.post(content)
+    if not dry:
+        BSKY_CLIENT.post("The following is a summary BY AI based on Donald Trump's reported actions: \n" + content)
 
 # Main function
 def main():
@@ -251,7 +268,7 @@ def main():
     entries = get_articles_from_rss(rss_feed_url)
     summaries = analyze_and_summarize(entries)
     # post_to_bluesky(summaries)
-    print(summaries)
+    # print(summaries)
 
 if __name__ == "__main__":
     main()
