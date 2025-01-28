@@ -11,13 +11,16 @@ from autogen_core.application import SingleThreadedAgentRuntime
 from urllib.parse import urlparse
 from urllib.parse import parse_qs
 from dateutil import parser
-import grapheme
 import time
 import sys
+from typing import List, Dict
+import re
+
 # from autogen_ext.models import OpenAIChatCompletionClient
 
 import autogen
 from datetime import datetime, timedelta, timezone
+import pytz
 
 os.environ["AUTOGEN_USE_DOCKER"] = "False"  # Set to True if docker is available to run the generated code. Using docker is safer than running the generated code directly.
 
@@ -51,7 +54,7 @@ summarizer = autogen.UserProxyAgent(
     llm_config=llm_config,
     system_message="""You are the Summarizer. You take an article or piece of content and summarize it. You primarily are 
     concerned with summarzing the actions of President Donald Trump to extract the most impactful pieces of information from the content.
-    You will also rate the impact of each action or policy on a scale of 1-10.""",
+    You will also rate the impact of each action or policy on a scale of 1-10. You will never ever need to execute any code.""",
     human_input_mode="NEVER",
     # code_execution_config={
     #     "last_n_messages": 5,
@@ -88,18 +91,10 @@ BSKY_USER = env.get("BSKY_USER")
 BSKY_PASS = env.get("BSKY_PASS")
 
 # Set up the BlueSky client
-BSKY_CLIENT = Client()
-BSKY_CLIENT.login(BSKY_USER, BSKY_PASS)
+bsky_client = Client()
+bsky_client.login(BSKY_USER, BSKY_PASS)
 
-# Function to parse RSS feed and filter entries from the last N hours
-def parse_rss_feed(url, hours=24):
-    url = "https://www.google.com/alerts/feeds/14842518841889673538/2294658301143024541"
-    feed = feedparser.parse(url)
-    entries = feed.entries
-    cutoff_time = datetime.now() - timedelta(hours=hours)
-    recent_entries = [entry for entry in entries if datetime(*entry.published_parsed[:6]) > cutoff_time]
-    return recent_entries
-
+# Function to parse RSS feed and filter entries
 def get_articles_from_rss(rss_url):
     """
     Fetches articles from the given RSS URL and returns those published within the last hour.
@@ -115,7 +110,7 @@ def get_articles_from_rss(rss_url):
         feed = feedparser.parse(rss_url)
         
         # Get the current timezone info
-        tz = timezone.utc
+        tz = pytz.timezone('EST')  # Change this to the appropriate timezone if needed
 
         # Calculate one hour before now in UTC timezone
         now_utc = datetime.now(tz)
@@ -123,15 +118,25 @@ def get_articles_from_rss(rss_url):
 
         # Filter entries by date, converting to local time if necessary
         filtered_feed = []
+        log = False
         for entry in feed.entries:
+            # Skip youtube links
+            if 'youtube.com' in entry.link:
+                # print("************* Skipping youtube link: ", entry.link, "*************")
+                continue
             # Convert entry.published to the same timezone as last_hour (UTC)
             pubdate = parser.parse(entry.published)
-            print("\n\n---\nentry.published: ", pubdate)
-            print("entry.title was: ", entry.title)
-            # print("text was: ", entry.text)
-            if last_run.timestamp() >= pubdate.timestamp():
+            if log:
+                print("--------\nJust got an article_from_rss feed!!")
+                print("entry.title was: ", entry.title)
+                print("entry.link was: ", entry.link)
+                print("now_utc was: ", now_utc)
+                print("pub_date.timestamp() was: ", pubdate.timestamp(), " | pub_date was: ", pubdate)
+                print("last_run.timestamp() was: ", last_run.timestamp(), " | last_run was: ", last_run)
+                print("conditional is last_run.timestamp() >= pubdate.timestamp()")
+            if pubdate.timestamp() >= last_run.timestamp():
                 filtered_feed.append(entry)
-            print("\nfiltered feed was: \n", filtered_feed)
+            # print("\nfiltered feed was: \n", filtered_feed)
         return filtered_feed
     
     except Exception as e:
@@ -210,19 +215,48 @@ def analyze_and_summarize(entries, dry=True):
         # print("link was: ", link)
         parsed = urlparse(link)
         actual_link = parse_qs(parsed.query)['url'][0]
-        news_content = extract_news_from_article(actual_link) if 'youtube' not in actual_link else "YouTube video content"
+
+        # If it's a youtube link, skip to the next entry.
+        if 'youtube' in actual_link:
+            continue
+
+        news_content = extract_news_from_article(actual_link)
         news_content = extract_text_from_html(news_content)
 
         chat = f"""Given the following content from a news article, ```Content: {news_content}```, please summarize 
         the actions of President Donald Trump and rate the impact of each action on a scale of 1-10. Give a very very brief analysis of how to counter act each action.
-        Importantly, do not respond with any greetings or cordialities. Provide me only with the requested information in the form of:
-        ```Act: [Action/Policy]
-        Impact: [Rating]
-        Analysis: [Your terse/concise analysis]```
+        Importantly, do not respond with any greetings or cordialities. Provide me with the requested analysis in the form of:
 
-        Please remember that the full content may be spread across
-        many divs or spans, so you may need to extract the relevant information from the content.
-        It'c critical that you keep your responses to no more than 300 characters.
+        [YOUR SUMMARY]
+        **Analysis header here**
+        '''
+        Act: [ACTION/POLICY]
+        Impact: [RATING]/10
+        Analysis: [YOUR TERSE/CONCISE ANALYSIS]
+        Potential counters: [SUGGESTED ACTIONS]'''
+
+        Make sure you introduce the SUMMARIES with an opening paragraph of no more than 2 very short sentence in which you describe the overall 
+        content of the article, and the biggest takeaways, and nothing more.
+        It's critical that you keep your response for each SUMMARY to no more than 250 characters, as well as the introductory summary. Make sure each
+        individual summary is headered by **Summary 1**, **Summary 2**, etc.
+
+        In its entirety, your response should look something like this:
+
+        '''
+        [INTRODUCTORY SUMMARY OF 2 SENTENCES]
+
+        **Summary 1**
+        Act: [ACTION/POLICY]
+        Impact: [RATING]/10
+        Analysis: [YOUR TERSE/CONCISE ANALYSIS]
+        Potential counters: [SUGGESTED ACTIONS]
+
+        **Summary 2**
+        Act: [ACTION/POLICY]
+        Impact: [RATING]/10
+        Analysis: [YOUR TERSE/CONCISE ANALYSIS]
+        Potential counters: [SUGGESTED ACTIONS]
+        '''
         """
 
         chat_manager = autogen.GroupChatManager(groupchat)
@@ -233,36 +267,44 @@ def analyze_and_summarize(entries, dry=True):
 
         summary = groupchat_result.chat_history[-1].get('content', '')
 
-        splits = summary.split("Act:")
+        splits = re.split(r'\*\*Summary \d+\*\*', summary)
         print("link was: ", actual_link,"\n===========\n")
         
         url = 'http://tinyurl.com/api-create.php?url='
-        # long_url = actual_link
 
-        response = requests.get(url+actual_link)
-        short_url = response.text
-        for split in splits[1:]:
-            summary = "This post generated by AI: \nLink: " + short_url + "\nDate: " + entry.published + "\nAct: " + split
+        tinyurl_response = requests.get(url+actual_link)
+        short_url = tinyurl_response.text
+        for split in splits:
+            if split == '':
+                continue
+
+            print("\n\n----\nsplit was: ", split)
+            summary = "*Post generated by AI*\nLink: " + short_url + "\nDate: " + entry.published + "\n" + split
             summaries.append(summary)
             if len(summary) < 250:
                 post_to_bluesky(summary, dry=dry)
                 time.sleep(5)
             else:
-                print("\n\n------\nTOO LONG TO POST TO BLUESKY! SKIPPING: \n", summary, "\n\n=========\n")
+                print("\n\n------\nTOO LONG TO POST TO BLUESKY! Splitting: \n", summary, "\n\n=========\n")
+                for i in range(0, len(summary), 250):
+                    sub_summary = summary[i:i+250]
+                    post_to_bluesky(sub_summary, dry=dry)
+                    time.sleep(5)
     return summaries
 
 # Function to post summary to BlueSky
 def post_to_bluesky(content, dry=True):
     print("\n--\nPosting to BlueSky... \n", content)
     if not dry:
-        BSKY_CLIENT.post(content)
+        bsky_client.send_post(content)
 
 # Main function
 def main():
     dry = sys.argv[1] if len(sys.argv) > 1 else True
     rss_feed_url = "https://www.google.com/alerts/feeds/14842518841889673538/2294658301143024541"
     entries = get_articles_from_rss(rss_feed_url)
-    summaries = analyze_and_summarize(entries, False)
+    summaries = analyze_and_summarize(entries, dry=True)
+    # post_to_bluesky("Test!", dry=False)
     # post_to_bluesky(summaries)
     # print(summaries)
 
