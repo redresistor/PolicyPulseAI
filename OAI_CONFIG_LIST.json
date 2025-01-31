@@ -13,5 +13,10 @@
         "model": "code_runner_llama3",
         "api_key": "n/a",
         "base_url": "http://localhost:1234/v1"
+    },
+    {
+        "model": "llama-3.2-3b-instruct-uncensored",
+        "api_key": "n/a",
+        "base_url": "http://localhost:1234/v1"
     }
 ]
